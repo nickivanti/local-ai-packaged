@@ -12,13 +12,51 @@ import subprocess
 import shutil
 import time
 import argparse
-import platform
 import sys
+import secrets
+from datetime import datetime
 
 def run_command(cmd, cwd=None):
     """Run a shell command and print it."""
     print("Running:", " ".join(cmd))
     subprocess.run(cmd, cwd=cwd, check=True)
+
+
+def ensure_docker_available():
+    """Fail fast if Docker CLI or daemon is unavailable."""
+    if shutil.which("docker") is None:
+        raise RuntimeError(
+            "Docker CLI was not found in PATH. Install Docker and ensure the `docker` command is available."
+        )
+
+    try:
+        subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(
+            "Docker daemon is not reachable. Start Docker Desktop or the Docker service, then rerun the script."
+            + (f"\nDocker output: {details}" if details else "")
+        ) from exc
+
+
+def _git_porcelain_status(cwd: str) -> str:
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_has_local_changes(cwd: str) -> bool:
+    return bool(_git_porcelain_status(cwd))
 
 def clone_supabase_repo():
     """Clone the Supabase repository using sparse checkout if not already present."""
@@ -35,9 +73,37 @@ def clone_supabase_repo():
         os.chdir("..")
     else:
         print("Supabase repository already exists, updating...")
-        os.chdir("supabase")
-        run_command(["git", "pull"])
-        os.chdir("..")
+        supabase_dir = os.path.join(os.getcwd(), "supabase")
+        stashed = False
+        try:
+            if _git_has_local_changes(supabase_dir):
+                ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                print("Detected local changes in supabase repository.")
+                print("Stashing changes so the update can proceed...")
+                run_command([
+                    "git",
+                    "stash",
+                    "push",
+                    "-u",
+                    "-m",
+                    f"start_services.py auto-stash {ts}",
+                ], cwd=supabase_dir)
+                stashed = True
+
+            run_command(["git", "pull"], cwd=supabase_dir)
+
+            if stashed:
+                print(
+                    "Supabase update complete. Your previous local changes were stashed. "
+                    "To re-apply them later, run: git -C supabase stash list && git -C supabase stash pop"
+                )
+        except subprocess.CalledProcessError:
+            print("Error updating the Supabase repository.")
+            print("To recover manually:")
+            print("  - Inspect changes: git -C supabase status")
+            print("  - Stash changes:  git -C supabase stash -u")
+            print("  - OR reset hard:  git -C supabase reset --hard && git -C supabase clean -fd")
+            raise
 
 def prepare_supabase_env():
     """Copy .env to .env in supabase/docker."""
@@ -102,52 +168,36 @@ def generate_searxng_secret_key():
     else:
         print(f"SearXNG settings.yml already exists at {settings_path}")
 
+    if not os.access(settings_path, os.W_OK):
+        print(
+            f"Cannot write to {settings_path}. Current user does not have permission to update the SearXNG secret key."
+        )
+        print("Fix the ownership or permissions, then rerun the script.")
+        print(f"  - Suggested fix: sudo chown -R $USER:$USER searxng")
+        print(f"  - Or: sudo chmod u+w {settings_path}")
+        return
+
     print("Generating SearXNG secret key...")
 
-    # Detect the platform and run the appropriate command
-    system = platform.system()
-
     try:
-        if system == "Windows":
-            print("Detected Windows platform, using PowerShell to generate secret key...")
-            # PowerShell command to generate a random key and replace in the settings file
-            ps_command = [
-                "powershell", "-Command",
-                "$randomBytes = New-Object byte[] 32; " +
-                "(New-Object Security.Cryptography.RNGCryptoServiceProvider).GetBytes($randomBytes); " +
-                "$secretKey = -join ($randomBytes | ForEach-Object { \"{0:x2}\" -f $_ }); " +
-                "(Get-Content searxng/settings.yml) -replace 'ultrasecretkey', $secretKey | Set-Content searxng/settings.yml"
-            ]
-            subprocess.run(ps_command, check=True)
+        with open(settings_path, 'r', encoding='utf-8') as file:
+            content = file.read()
 
-        elif system == "Darwin":  # macOS
-            print("Detected macOS platform, using sed command with empty string parameter...")
-            # macOS sed command requires an empty string for the -i parameter
-            openssl_cmd = ["openssl", "rand", "-hex", "32"]
-            random_key = subprocess.check_output(openssl_cmd).decode('utf-8').strip()
-            sed_cmd = ["sed", "-i", "", f"s|ultrasecretkey|{random_key}|g", settings_path]
-            subprocess.run(sed_cmd, check=True)
+        random_key = secrets.token_hex(32)
+        updated_content = content.replace("ultrasecretkey", random_key)
 
-        else:  # Linux and other Unix-like systems
-            print("Detected Linux/Unix platform, using standard sed command...")
-            # Standard sed command for Linux
-            openssl_cmd = ["openssl", "rand", "-hex", "32"]
-            random_key = subprocess.check_output(openssl_cmd).decode('utf-8').strip()
-            sed_cmd = ["sed", "-i", f"s|ultrasecretkey|{random_key}|g", settings_path]
-            subprocess.run(sed_cmd, check=True)
+        if updated_content == content:
+            print("SearXNG secret key placeholder not found; leaving the existing secret unchanged.")
+            return
+
+        with open(settings_path, 'w', encoding='utf-8') as file:
+            file.write(updated_content)
 
         print("SearXNG secret key generated successfully.")
 
     except Exception as e:
         print(f"Error generating SearXNG secret key: {e}")
-        print("You may need to manually generate the secret key using the commands:")
-        print("  - Linux: sed -i \"s|ultrasecretkey|$(openssl rand -hex 32)|g\" searxng/settings.yml")
-        print("  - macOS: sed -i '' \"s|ultrasecretkey|$(openssl rand -hex 32)|g\" searxng/settings.yml")
-        print("  - Windows (PowerShell):")
-        print("    $randomBytes = New-Object byte[] 32")
-        print("    (New-Object Security.Cryptography.RNGCryptoServiceProvider).GetBytes($randomBytes)")
-        print("    $secretKey = -join ($randomBytes | ForEach-Object { \"{0:x2}\" -f $_ })")
-        print("    (Get-Content searxng/settings.yml) -replace 'ultrasecretkey', $secretKey | Set-Content searxng/settings.yml")
+        print("You may need to manually set a 64-character hex secret in searxng/settings.yml.")
 
 def check_and_fix_docker_compose_for_searxng():
     """Check and modify docker-compose.yml for SearXNG first run."""
@@ -230,6 +280,9 @@ def main():
 
     # Generate SearXNG secret key and check docker-compose.yml
     generate_searxng_secret_key()
+
+    ensure_docker_available()
+
     check_and_fix_docker_compose_for_searxng()
 
     stop_existing_containers(args.profile)
@@ -245,4 +298,8 @@ def main():
     start_local_ai(args.profile, args.environment)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        print(exc)
+        sys.exit(1)

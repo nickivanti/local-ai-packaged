@@ -29,6 +29,29 @@ x-n8n: &service-n8n
     - N8N_USER_MANAGEMENT_JWT_SECRET
     - WEBHOOK_URL=${N8N_HOSTNAME:+https://}${N8N_HOSTNAME:-http://localhost:5678}
 
+    # ---- Workflow runtime env (available via $env.* in n8n) ----
+    # Supabase REST base URL (inside the docker network, Supabase is fronted by Kong)
+    - SUPABASE_REST_URL=${SUPABASE_REST_URL:-http://kong:8000}
+
+    # Prefer dedicated names for workflows; map to the Supabase self-hosting keys in .env
+    - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-${SERVICE_ROLE_KEY}}
+    - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-${ANON_KEY}}
+
+    # Azure OpenAI (embeddings + chat for semantic chunking)
+    - AZURE_OPENAI_ENDPOINT
+    - AZURE_OPENAI_API_KEY
+    - AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT
+    - AZURE_OPENAI_CHAT_DEPLOYMENT
+    - AZURE_OPENAI_API_VERSION
+
+    # Azure Document Intelligence (optional OCR/layout extraction)
+    - AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
+    - AZURE_DOCUMENT_INTELLIGENCE_API_KEY
+
+    # Back-compat aliases (older workflows referenced AZURE_DI_*)
+    - AZURE_DI_ENDPOINT=${AZURE_DI_ENDPOINT:-${AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT}}
+    - AZURE_DI_API_KEY=${AZURE_DI_API_KEY:-${AZURE_DOCUMENT_INTELLIGENCE_API_KEY}}
+
 x-ollama: &service-ollama
   image: ollama/ollama:latest
   container_name: ollama
@@ -303,7 +326,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: postgres
     volumes:
-      - langfuse_postgres_data:/var/lib/postgresql/data
+      - langfuse_postgres_data:/var/lib/postgresql
 
   redis:
     container_name: redis
@@ -367,8 +390,16 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
+    ports:
+      - "11435:11434"  # Map external port 11435 to internal 11434
+    environment:
+      - OLLAMA_CONTEXT_LENGTH=8192
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+      - OLLAMA_MAX_LOADED_MODELS=2
+      - OLLAMA_ORIGINS=*  # Allow all origins for network access
 
   ollama-gpu-amd:
     profiles: ["gpu-amd"]
